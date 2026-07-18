@@ -23,7 +23,7 @@ import os
 import time
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -123,7 +123,7 @@ def paginate(path: str, params: dict | None = None, limit: int = 250):
 
 def save_raw(data, filename: str):
     """Land raw JSON to disk, mirroring how you'd write to Blob/S3 later."""
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     day_dir = RAW_DATA_DIR / today
     day_dir.mkdir(parents=True, exist_ok=True)
     out_path = day_dir / filename
@@ -140,7 +140,7 @@ def get_updated_bills(congress: int, since_days: int = 1) -> list[dict]:
     Pull bills updated in the last `since_days` days for a given Congress.
     Feeds dim_bill.
     """
-    from_dt = (datetime.utcnow() - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    from_dt = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     bills = list(
         paginate(f"/bill/{congress}", params={"fromDateTime": from_dt})
     )
