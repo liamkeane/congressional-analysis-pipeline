@@ -1,22 +1,8 @@
 """
-congress_client.py
+client.py
 
-Minimal, safe starter client for the Congress.gov API (api.congress.gov, v3).
+Wrapper client for the Congress.gov API (api.congress.gov, v3).
 
-SAFE KEY HANDLING:
-  - Your real API key lives in a local ".env" file (never committed to git).
-  - ".env" is already listed in .gitignore.
-  - This script loads the key at runtime via python-dotenv + os.environ.
-  - Never hardcode the key in this file, never print it, never log it.
-
-SETUP:
-  1. pip install -r requirements.txt
-  2. cp .env.example .env
-  3. Edit .env and paste your real key in place of "your_key_here"
-  4. Sign up for a free key at: https://api.congress.gov/sign-up/
-
-USAGE:
-  python congress_client.py
 """
 
 import os
