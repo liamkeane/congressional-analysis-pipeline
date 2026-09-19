@@ -1,179 +1,214 @@
 """
-client.py
+congress_client/client.py
 
-Wrapper client for the Congress.gov API (api.congress.gov, v3).
+Low-level HTTP client for the congress.gov API. Handles:
+  - auth (api_key as a query param)
+  - rate limiting (5,000 requests/hour per key, enforced client-side)
+  - retries with backoff (transient errors + 429s, respecting Retry-After)
+  - pagination (follows `pagination.next` and unwraps the response envelope)
+
+Everything in endpoints.py is built on top of the two public methods here:
+`get_congress()` for single requests, `get_paginated()` for list endpoints.
 
 """
 
+from __future__ import annotations
+
+import logging
 import os
 import time
-import json
-import logging
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from typing import Iterator, Optional
+from urllib.parse import urlparse, parse_qs
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 
+logger = logging.getLogger(__name__)
+
 load_dotenv()  # reads .env into environment variables, if present
 
-API_KEY = os.environ.get("CONGRESS_API_KEY")
-if not API_KEY:
-    raise RuntimeError(
-        "CONGRESS_API_KEY not found in .env file."
-    )
-
 BASE_URL = "https://api.congress.gov/v3"
-RAW_DATA_DIR = Path("raw-data")  # will eventually be an S3 landing zone
-RAW_DATA_DIR.mkdir(exist_ok=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger(__name__)
+# congress.gov's stated ceiling. Kept slightly conservative on purpose --
+# see _RateLimiter below.
+MAX_REQUESTS_PER_HOUR = 5_000
 
 
-# ---------------------------------------------------------------------------
-# Core request wrapper
-# ---------------------------------------------------------------------------
+class CongressAPIError(Exception):
+    """Raised for non-retryable HTTP errors from the API."""
 
-def congress_get(path: str, params: dict | None = None, max_retries: int = 5) -> dict:
+    def __init__(self, status_code: int, message: str, url: str):
+        self.status_code = status_code
+        self.url = url
+        super().__init__(f"[{status_code}] {message} ({url})")
+
+
+class _RateLimiter:
     """
-    GET a Congress.gov API endpoint with the key injected safely as a query
-    param (never in the URL you log or print), basic retry/backoff on
-    rate-limit (429) and transient server errors, and JSON parsing.
-
-    path: e.g. "/bill/119" or "/bill/119/hr/1/actions"
+    Simple leaky-bucket throttle: enforces a minimum interval between
+    requests so that (sustained over an hour) we stay under the API's cap.
     """
-    url = f"{BASE_URL}{path}"
-    params = dict(params or {})
-    params["api_key"] = API_KEY
-    params.setdefault("format", "json")
 
-    for attempt in range(1, max_retries + 1):
-        response = requests.get(url, params=params, timeout=30)
+    def __init__(self, max_per_hour: int = MAX_REQUESTS_PER_HOUR, safety_margin: float = 0.9):
+        # safety_margin leaves headroom below the stated cap for clock drift,
+        # retries, and any other process sharing the same key.
+        effective_max = max(1, int(max_per_hour * safety_margin))
+        self._min_interval = 3600.0 / effective_max
+        self._last_call_at: Optional[float] = None
 
-        if response.status_code == 200:
-            return response.json()
+    def wait(self) -> None:
+        if self._last_call_at is not None:
+            elapsed = time.monotonic() - self._last_call_at
+            remaining = self._min_interval - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_call_at = time.monotonic()
+
+
+class CongressClient:
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: str = BASE_URL,
+        max_requests_per_hour: int = MAX_REQUESTS_PER_HOUR,
+        timeout: float = 30.0,
+        page_limit: int = 250,  # API max per page
+    ):
+        
+        self.api_key = api_key or os.environ.get("CONGRESS_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "No API key provided. Pass api_key= or set CONGRESS_API_KEY."
+            )
+
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.page_limit = page_limit
+
+        self._rate_limiter = _RateLimiter(max_requests_per_hour)
+        self._session = self._build_session()
+
+    # ----------------------------------------------------------------
+    # Session / retry setup
+    # ----------------------------------------------------------------
+
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        retry = Retry(
+            total=5,
+            backoff_factor=1.5,  # 1.5s, 3s, 6s, 12s, 24s
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    # ----------------------------------------------------------------
+    # Public API
+    # ----------------------------------------------------------------
+
+    def get_congress(self, path: str, params: Optional[dict] = None) -> dict:
+        """
+        Single request against `path` (relative, e.g. "/bill/119/s/5").
+        Returns the parsed JSON body as-is (full envelope, including
+        `pagination`/`request` keys if present) -- callers that need the
+        unwrapped resource should use get_paginated for list endpoints,
+        or index into the known top-level key for detail endpoints.
+        """
+        url = self._full_url(path)
+        query = dict(params or {})
+        query.setdefault("format", "json")
+        query["api_key"] = self.api_key
+
+        self._rate_limiter.wait()
+
+        response = self._session.get(url, params=query, timeout=self.timeout)
 
         if response.status_code == 429:
-            wait = 2 ** attempt  # exponential backoff: 2, 4, 8, 16, 32s
-            log.warning(f"Rate limited on {path}. Retrying in {wait}s (attempt {attempt}).")
-            time.sleep(wait)
-            continue
+            # Retry adapter should normally absorb this, but handle the
+            # case where retries are exhausted.
+            retry_after = int(response.headers.get("Retry-After", 60))
+            logger.warning("Rate limited after retries exhausted; sleeping %ss", retry_after)
+            time.sleep(retry_after)
+            response = self._session.get(url, params=query, timeout=self.timeout)
 
-        if 500 <= response.status_code < 600:
-            wait = 2 ** attempt
-            log.warning(f"Server error {response.status_code} on {path}. Retrying in {wait}s.")
-            time.sleep(wait)
-            continue
+        if not response.ok:
+            raise CongressAPIError(response.status_code, response.text[:500], url)
 
-        # Non-retryable error (bad request, bad key, not found, etc.)
-        response.raise_for_status()
+        return response.json()
 
-    raise RuntimeError(f"Failed to fetch {path} after {max_retries} retries.")
+    def get_paginated(self, path: str, params: Optional[dict] = None) -> Iterator[dict]:
+        """
+        Yields individual items from a list endpoint, following
+        `pagination.next` until exhausted. Unwraps the envelope
+        automatically -- callers get bare item dicts (e.g. each bill),
+        not the `{"bills": [...], "pagination": {...}}` wrapper.
+        """
+        query = dict(params or {})
+        query.setdefault("limit", self.page_limit)
+        query.setdefault("offset", 0)
 
+        next_path: Optional[str] = path
+        next_params: Optional[dict] = query
 
-def paginate(path: str, params: dict | None = None, limit: int = 250):
-    """
-    Generator that walks all pages of a Congress.gov list endpoint.
-    The API caps 'limit' at 250 per page and exposes pagination via
-    a 'next' URL in the response.
-    """
-    params = dict(params or {})
-    params["limit"] = limit
-    offset = 0
+        while next_path is not None:
+            payload = self.get_congress(next_path, params=next_params)
 
-    while True:
-        params["offset"] = offset
-        data = congress_get(path, params)
+            items = self._unwrap_items(payload, context_path=next_path)
+            for item in items:
+                yield item
 
-        # The list key name varies by endpoint (e.g. "bills", "members")
-        list_key = next((k for k in data.keys() if isinstance(data[k], list)), None)
-        if not list_key:
-            break
+            next_url = payload.get("pagination", {}).get("next")
+            if not next_url:
+                break
 
-        items = data[list_key]
-        if not items:
-            break
+            # `next` is typically a full URL with its own limit/offset (and
+            # api_key already stripped by the API) -- extract path + params
+            # rather than assuming offset arithmetic, since that's what the
+            # API actually hands us and is more robust to it changing.
+            next_path, next_params = self._parse_next_url(next_url)
 
-        yield from items
+    # ----------------------------------------------------------------
+    # Internals
+    # ----------------------------------------------------------------
 
-        pagination = data.get("pagination", {})
-        if not pagination.get("next"):
-            break
-        offset += limit
+    def _full_url(self, path: str) -> str:
+        if path.startswith("http"):
+            return path
+        return f"{self.base_url}/{path.lstrip('/')}"
 
+    @staticmethod
+    def _unwrap_items(payload: dict, context_path: str) -> list:
+        """
+        List endpoints wrap results under a resource-named key that varies
+        by endpoint ("bills", "members", "actions", "cosponsors", ...).
+        Rather than hardcode every key name, take the first list-valued
+        entry that isn't `pagination` or `request`.
+        """
+        for key, value in payload.items():
+            if key in ("pagination", "request"):
+                continue
+            if isinstance(value, list):
+                return value
 
-def save_raw(data, filename: str):
-    """Land raw JSON to disk, mirroring how you'd write to Blob/S3 later."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    day_dir = RAW_DATA_DIR / today
-    day_dir.mkdir(parents=True, exist_ok=True)
-    out_path = day_dir / filename
-    out_path.write_text(json.dumps(data, indent=2))
-    log.info(f"Wrote {out_path}")
+        logger.warning("No list payload found in response for %s", context_path)
+        return []
 
-
-# ---------------------------------------------------------------------------
-# Example extract functions (map to your fact/dim tables)
-# ---------------------------------------------------------------------------
-
-def get_updated_bills(congress: int, since_days: int = 1) -> list[dict]:
-    """
-    Pull bills updated in the last `since_days` days for a given Congress.
-    Feeds dim_bill.
-    """
-    from_dt = (datetime.now(timezone.utc) - timedelta(days=since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    bills = list(
-        paginate(f"/bill/{congress}", params={"fromDateTime": from_dt})
-    )
-    log.info(f"Fetched {len(bills)} updated bills for Congress {congress}.")
-    return bills
-
-
-def get_bill_actions(congress: int, bill_type: str, bill_number: int) -> list[dict]:
-    """Feeds fct_bill_actions."""
-    data = congress_get(f"/bill/{congress}/{bill_type}/{bill_number}/actions")
-    return data.get("actions", [])
-
-
-def get_bill_cosponsors(congress: int, bill_type: str, bill_number: int) -> list[dict]:
-    """Feeds fct_bill_cosponsors."""
-    data = congress_get(f"/bill/{congress}/{bill_type}/{bill_number}/cosponsors")
-    return data.get("cosponsors", [])
-
-
-def get_bill_subjects(congress: int, bill_type: str, bill_number: int) -> dict:
-    """Feeds bridge_bill_subject."""
-    data = congress_get(f"/bill/{congress}/{bill_type}/{bill_number}/subjects")
-    return data.get("subjects", {})
-
-
-# ---------------------------------------------------------------------------
-# Example run
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    CONGRESS = 119
-
-    updated_bills = get_updated_bills(CONGRESS, since_days=1)
-    save_raw(updated_bills, "bills_updated.json")
-
-    # For each updated bill, pull the related sub-resources.
-    # (In your Airflow DAG, this loop becomes a set of mapped/dynamic tasks.)
-    for bill in updated_bills[:5]:  # small slice for a first test run
-        bill_type = bill["type"].lower()
-        bill_number = bill["number"]
-
-        actions = get_bill_actions(CONGRESS, bill_type, bill_number)
-        cosponsors = get_bill_cosponsors(CONGRESS, bill_type, bill_number)
-        subjects = get_bill_subjects(CONGRESS, bill_type, bill_number)
-
-        save_raw(actions, f"actions_{bill_type}{bill_number}.json")
-        save_raw(cosponsors, f"cosponsors_{bill_type}{bill_number}.json")
-        save_raw(subjects, f"subjects_{bill_type}{bill_number}.json")
-
-    log.info("Done.")
+    @staticmethod
+    def _parse_next_url(next_url: str) -> tuple[str, dict]:
+        parsed = urlparse(next_url)
+        params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        # api_key gets re-added by get(); drop it here if present so we
+        # don't accidentally carry a stale/mismatched one.
+        params.pop("api_key", None)
+        return parsed.path, params
