@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from email.utils import parsedate_to_datetime
 from typing import Iterator, Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -38,6 +39,12 @@ BASE_URL = "https://api.congress.gov/v3"
 # congress.gov's stated ceiling. Kept slightly conservative on purpose --
 # see _RateLimiter below.
 MAX_REQUESTS_PER_HOUR = 5_000
+
+# Fallback sleep when a 429 arrives without a usable Retry-After header.
+DEFAULT_RETRY_AFTER_SECONDS = 60
+
+# Envelope keys that are metadata, never the resource payload.
+_ENVELOPE_KEYS = ("pagination", "request")
 
 
 class CongressAPIError(Exception):
@@ -80,7 +87,7 @@ class CongressClient:
         timeout: float = 30.0,
         page_limit: int = 250,  # API max per page
     ):
-        
+
         self.api_key = api_key or os.environ.get("CONGRESS_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -93,6 +100,19 @@ class CongressClient:
 
         self._rate_limiter = _RateLimiter(max_requests_per_hour)
         self._session = self._build_session()
+
+    # ----------------------------------------------------------------
+    # Lifecycle
+    # ----------------------------------------------------------------
+
+    def close(self) -> None:
+        self._session.close()
+
+    def __enter__(self) -> "CongressClient":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 
     # ----------------------------------------------------------------
     # Session / retry setup
@@ -111,6 +131,7 @@ class CongressClient:
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
+        session.headers.update({"Accept": "application/json"})
         return session
 
     # ----------------------------------------------------------------
@@ -119,7 +140,8 @@ class CongressClient:
 
     def get_congress(self, path: str, params: Optional[dict] = None) -> dict:
         """
-        Single request against `path` (relative, e.g. "/bill/119/s/5").
+        Single request against `path` (relative, e.g. "/bill/119/s/5", or a
+        full URL as handed back in `pagination.next`).
         Returns the parsed JSON body as-is (full envelope, including
         `pagination`/`request` keys if present) -- callers that need the
         unwrapped resource should use get_paginated for list endpoints,
@@ -137,15 +159,21 @@ class CongressClient:
         if response.status_code == 429:
             # Retry adapter should normally absorb this, but handle the
             # case where retries are exhausted.
-            retry_after = int(response.headers.get("Retry-After", 60))
+            retry_after = self._retry_after_seconds(response)
             logger.warning("Rate limited after retries exhausted; sleeping %ss", retry_after)
             time.sleep(retry_after)
+            self._rate_limiter.wait()
             response = self._session.get(url, params=query, timeout=self.timeout)
 
         if not response.ok:
             raise CongressAPIError(response.status_code, response.text[:500], url)
 
-        return response.json()
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise CongressAPIError(
+                response.status_code, f"Response was not valid JSON: {exc}", url
+            ) from exc
 
     def get_paginated(self, path: str, params: Optional[dict] = None) -> Iterator[dict]:
         """
@@ -169,14 +197,17 @@ class CongressClient:
                 yield item
 
             next_url = payload.get("pagination", {}).get("next")
-            if not next_url:
+            if not next_url or not items:
                 break
 
             # `next` is typically a full URL with its own limit/offset (and
             # api_key already stripped by the API) -- extract path + params
             # rather than assuming offset arithmetic, since that's what the
             # API actually hands us and is more robust to it changing.
-            next_path, next_params = self._parse_next_url(next_url)
+            # Original filters are layered underneath in case `next` drops
+            # any of them (e.g. fromDateTime); `next`'s own values win.
+            next_path, parsed_params = self._parse_next_url(next_url)
+            next_params = {**query, **parsed_params}
 
     # ----------------------------------------------------------------
     # Internals
@@ -188,27 +219,64 @@ class CongressClient:
         return f"{self.base_url}/{path.lstrip('/')}"
 
     @staticmethod
+    def _retry_after_seconds(response: requests.Response) -> float:
+        """Retry-After may be delta-seconds or an HTTP date; handle both."""
+        header = response.headers.get("Retry-After")
+        if not header:
+            return DEFAULT_RETRY_AFTER_SECONDS
+        try:
+            return max(0.0, float(header))
+        except ValueError:
+            pass
+        try:
+            retry_at = parsedate_to_datetime(header)
+            return max(0.0, retry_at.timestamp() - time.time())
+        except (TypeError, ValueError):
+            return DEFAULT_RETRY_AFTER_SECONDS
+
+    @staticmethod
     def _unwrap_items(payload: dict, context_path: str) -> list:
         """
         List endpoints wrap results under a resource-named key that varies
         by endpoint ("bills", "members", "actions", "cosponsors", ...).
         Rather than hardcode every key name, take the first list-valued
         entry that isn't `pagination` or `request`.
+
+        A few endpoints nest the list one level deeper inside an object
+        (e.g. bill subjects -> {"subjects": {"legislativeSubjects": [...],
+        "policyArea": {...}}}, house vote members ->
+        {"houseRollCallVoteMemberVotes": {..., "results": [...]}}). If no
+        top-level list exists, fall back to the first list found one level
+        down. Sibling scalar/object fields at that level are dropped; they
+        are available from the corresponding detail endpoint.
         """
         for key, value in payload.items():
-            if key in ("pagination", "request"):
+            if key in _ENVELOPE_KEYS:
                 continue
             if isinstance(value, list):
                 return value
+
+        for key, value in payload.items():
+            if key in _ENVELOPE_KEYS or not isinstance(value, dict):
+                continue
+            for inner_value in value.values():
+                if isinstance(inner_value, list):
+                    return inner_value
 
         logger.warning("No list payload found in response for %s", context_path)
         return []
 
     @staticmethod
     def _parse_next_url(next_url: str) -> tuple[str, dict]:
+        """
+        Split `pagination.next` into (url, params). The URL is returned
+        absolute -- its path already includes the `/v3` prefix, so joining
+        a bare path onto base_url would double it up.
+        """
         parsed = urlparse(next_url)
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-        # api_key gets re-added by get(); drop it here if present so we
-        # don't accidentally carry a stale/mismatched one.
+        # api_key gets re-added by get_congress(); drop it here if present
+        # so we don't accidentally carry a stale/mismatched one.
         params.pop("api_key", None)
-        return parsed.path, params
+        url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        return url, params
