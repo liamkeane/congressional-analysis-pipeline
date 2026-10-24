@@ -26,6 +26,10 @@ Design notes:
   - Functions are intentionally thin: build the path, pass through params,
     return what the client gives back. No parsing/flattening here -- that
     belongs in staging models downstream of the raw landing layer.
+  - List functions `return client.get_paginated(...)` rather than
+    `yield from` it. A `yield` would make the function itself a generator,
+    deferring argument validation (e.g. "bill_type requires congress")
+    until the caller first iterates; returning keeps it eager.
   - Detail endpoints return the full envelope (e.g. `{"bill": {...},
     "request": {...}}`), so the raw landing layer keeps everything.
   - `bill_type` is passed lowercase (e.g. "hr", "s", "hjres") to match the
@@ -97,7 +101,7 @@ def get_bills(
     else:
         path = "/bill"
 
-    yield from client.get_paginated(path, params=_date_params(from_date, to_date))
+    return client.get_paginated(path, params=_date_params(from_date, to_date))
 
 
 def get_bill_detail(
@@ -216,7 +220,7 @@ def get_summaries(
     else:
         path = "/summaries"
 
-    yield from client.get_paginated(path, params=_date_params(from_date, to_date))
+    return client.get_paginated(path, params=_date_params(from_date, to_date))
 
 
 # --------------------------------------------------------------------------
@@ -237,7 +241,7 @@ def get_members(
     params = _date_params(from_date, to_date)
     if current_member is not None:
         params["currentMember"] = str(current_member).lower()
-    yield from client.get_paginated("/member", params=params)
+    return client.get_paginated("/member", params=params)
 
 
 def get_members_by_congress(
@@ -293,7 +297,7 @@ def get_committees(
         segments.append(chamber)
     path = "/".join(segments)
 
-    yield from client.get_paginated(path, params=_date_params(from_date, to_date))
+    return client.get_paginated(path, params=_date_params(from_date, to_date))
 
 
 def get_committee_detail(
@@ -342,7 +346,7 @@ def get_amendments(
     else:
         path = "/amendment"
 
-    yield from client.get_paginated(path, params=_date_params(from_date, to_date))
+    return client.get_paginated(path, params=_date_params(from_date, to_date))
 
 
 def get_amendment_detail(
@@ -410,7 +414,7 @@ def get_house_votes(
     else:
         path = "/house-vote"
 
-    yield from client.get_paginated(path, params=_date_params(from_date, to_date))
+    return client.get_paginated(path, params=_date_params(from_date, to_date))
 
 
 def get_house_vote_detail(
