@@ -1,5 +1,7 @@
 import sys
 from pathlib import Path
 
-# Make `congress_client` importable without installing the package.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ingestion"))
+# Make `congress_client`, `backfill` and `landing` importable without installing anything.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "ingestion"))

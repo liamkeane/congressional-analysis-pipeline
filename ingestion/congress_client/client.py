@@ -58,8 +58,7 @@ class CongressAPIError(Exception):
 
 class _RateLimiter:
     """
-    Simple leaky-bucket throttle: enforces a minimum interval between
-    requests so that (sustained over an hour) we stay under the API's cap.
+    Enforces a minimum interval between requests so that over an hour we stay under the API's cap.
     """
 
     def __init__(self, max_per_hour: int = MAX_REQUESTS_PER_HOUR, safety_margin: float = 0.9):

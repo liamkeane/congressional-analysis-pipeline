@@ -219,3 +219,6 @@ __marimo__/
 
 # Data
 example-data/
+# Local landing zone + backfill checkpoints
+raw_data/
+.backfill_state/
