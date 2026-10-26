@@ -1,6 +1,6 @@
 import pytest
 
-from congress_client import endpoints
+from ingestion.congress_client import endpoints
 
 
 class RecordingClient:

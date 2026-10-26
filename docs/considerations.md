@@ -8,3 +8,10 @@
 6. Text fields need real cleaning. Action text fields are free-form legislative language ("Passed Senate without amendment by Yea-Nay Vote. 79 - 19. Record Vote Number: 71."). If you want to extract structured signal from this (e.g., pull out vote counts or record vote numbers), that's a legitimate parsing/regex task — good for showing SQL string manipulation or a light dbt macro.
 7. Many-to-many relationships everywhere. Bills-to-subjects, bills-to-committees, bills-to-cosponsors — all many-to-many, which is exactly why the bridge-table pattern I mentioned earlier matters. Handling these correctly (vs. flattening into comma-delimited strings, which is a common junior mistake) is a good signal.
 8. Duplicate/near-duplicate legislation. Companion bills (same bill introduced in both chambers) and related bills aren't automatically merged — the API has a relatedBills field, but reconciling "is this really the same policy effort" is a judgment call, not a clean join. You could choose to model this or explicitly scope it out — either is a fine interview answer as long as you can explain the decision.
+
+## Roadblocks
+
+1. My initial schema design was a bit ambitious. I had to simplify it to make my MVP more attainable. I'll leave a more complicated downstream schema as potential future work.
+    a. dim_bill and dim_member: dropped valid_from, valid_to and is_current. Both are Type 1 for now. Plans to introduce later.
+
+2. Does a backfill run that crosses midnight, or resumes the next day, write into one dt= folder or two? I'll have to pick one, handle it, and justify why.

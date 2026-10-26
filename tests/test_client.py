@@ -6,8 +6,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from congress_client import client as client_module
-from congress_client.client import CongressAPIError, CongressClient, _RateLimiter
+from ingestion.congress_client import client as client_module
+from ingestion.congress_client.client import CongressAPIError, CongressClient, _RateLimiter
 
 
 class FakeResponse:
