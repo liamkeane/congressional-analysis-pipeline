@@ -84,7 +84,7 @@ def get_bills(
 ) -> Iterator[dict]:
     """
     List bills. Scope narrows as args are provided:
-      - no congress: all bills across all congresses (rarely what you want)
+      - no congress: all bills across all congresses (yikes)
       - congress only: all bills in that congress
       - congress + bill_type: all bills of that type in that congress
 

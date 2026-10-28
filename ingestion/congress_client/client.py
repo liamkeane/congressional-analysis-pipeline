@@ -111,7 +111,7 @@ class CongressClient:
         return self
 
     def __exit__(self, *exc_info) -> None:
-        self.close()
+        self.close()    # For context manager support
 
     # ----------------------------------------------------------------
     # Session / retry setup
@@ -195,7 +195,7 @@ class CongressClient:
             for item in items:
                 yield item
 
-            next_url = payload.get("pagination", {}).get("next")
+            next_url = payload.get("pagination", {}).get("next")    # only runs once every item on the page has been handed to the caller
             if not next_url or not items:
                 break
 

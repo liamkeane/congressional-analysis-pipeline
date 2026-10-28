@@ -2,17 +2,18 @@
 
 ## Phase 0: Setup & scoping
 
-1. Get your Congress.gov API key
-2. Decide scope up front.
+1. Get the Congress.gov API key. It's free!
+2. Decide scope.
 3. Set up the repo skeleton, .gitignore, .env pattern
 4. Resource: Congress.gov API docs and their GitHub repo with example requests.
 
 ## Phase 1: Raw extraction
 
 1. Build out extract functions.
-2. Write to local disk first, but structured like writing to Blob (raw/{entity}/dt=YYYY-MM-DD/)
-3. Handle pagination and backoff properly
-4. Resources: requests + pathlib
+2. Handle pagination and backoff properly
+3. Handle the one off backfill task (before the DAGs take over)
+    a. Write to local disk first, but structured like writing to Blob (raw/{entity}/dt=YYYY-MM-DD/)
+5. Resources: requests + pathlib
 
 ## Phase 2: Move raw data to real cloud storage
 
@@ -28,11 +29,11 @@
 
 ## Phase 4: dbt transformation
 
-1. Init a dbt project, connect it to Snowflake (dbt-snowflake adapter)
-2. Build layer by layer: staging (1:1 with raw, light renaming/casting) → intermediate (joins, status-derivation logic) → marts (fact/dim tables)
-3. Add a dbt snapshot for dim_member and dim_bill (SCD Type 2 tables)
-4. Add tests throughout.
-5. Resource: dbt's own Jaffle Shop tutorial and their docs on incremental models and snapshots
+1. First, complete dbt's own Jaffle Shop tutorial and read their docs on incremental models and snapshots
+2. Init a dbt project, connect it to Snowflake (dbt-snowflake adapter)
+3. Build layer by layer: staging (1:1 with raw, light renaming/casting) → intermediate (joins, status-derivation logic) → marts (fact/dim tables)
+4. Add a dbt snapshot for dim_member and dim_bill(?). Defer this for now.
+5. Add tests throughout. 
 
 ## Phase 5: Orchestration with Airflow
 
