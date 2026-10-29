@@ -29,5 +29,5 @@
 
 3. Since the API is public and has request limitations, an hours (or day) long backfill is bound to fail for one reason or another-- and debugging will be slow. Also, the data may change while the backfill is being run...
     a. Loop through the list endpoint for bills *before* making sub requests for their details. With the limit of 250 per page and 20k bills, that comes to about 160 requests in the worst case, which should only take a couple of minutes to request. 
-    b. Backfilling bill details should be resumable since it would be around 40k(!) requests and will take hours. So it'll be a bummer when that inevitably fails. By saving the list first, we can skip any bill whose files already exist in the landing zone and continue from there.
+    b. Backfilling bill details should be resumable since it would be around 40k(!) requests and will take hours. So it'll be a bummer when that inevitably fails. But by saving the list first, we can skip any bill whose files already exist in the landing zone, so we avoid those redundant requests (assuming that the call takes place same day).
     c. Note that the members data is not (and should not) be included in bill detail loop. We can get all the info we need from the members list endpoint, which will only take a couple minutes and avoid redundancy.
