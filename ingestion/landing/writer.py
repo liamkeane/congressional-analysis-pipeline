@@ -20,6 +20,20 @@ from typing import Any, Optional
 DEFAULT_ROOT = Path("raw_data")
 
 
+def landing_dir(
+    source: str,
+    congress: Optional[int],
+    batch_ts: datetime,
+    root: Path = DEFAULT_ROOT,
+) -> Path:
+    """The folder one batch of a source lands in. Doesn't touch the disk."""
+    if batch_ts.tzinfo is None:
+        raise ValueError("batch_ts must be timezone-aware, e.g. datetime.now(timezone.utc)")
+    batch_date = batch_ts.astimezone(timezone.utc).date()
+
+    return Path(root) / source / f"dt={batch_date.isoformat()}" / f"congress={congress}"
+
+
 def landing_path(
     source: str,
     congress: Optional[int],
@@ -28,11 +42,7 @@ def landing_path(
     root: Path = DEFAULT_ROOT,
 ) -> Path:
     """Where a response for this entity lands. Doesn't touch the disk."""
-    if batch_ts.tzinfo is None:
-        raise ValueError("batch_ts must be timezone-aware, e.g. datetime.now(timezone.utc)")
-    batch_date = batch_ts.astimezone(timezone.utc).date()
-
-    return Path(root) / source / f"dt={batch_date.isoformat()}" / f"congress={congress}" / f"{entity_id}.json"
+    return landing_dir(source, congress, batch_ts, root) / f"{entity_id}.json"
 
 
 def land_raw(
