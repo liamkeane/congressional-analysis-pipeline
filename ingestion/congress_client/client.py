@@ -2,7 +2,8 @@
 congress_client/client.py
 
 Low-level HTTP client for the congress.gov API. Handles:
-  - auth (api_key as a query param)
+  - auth (api_key sent in the X-Api-Key header, so it never appears in
+    URLs, which urllib3 prints when it logs a retry)
   - rate limiting (5,000 requests/hour per key, enforced client-side)
   - retries with backoff (transient errors + 429s, respecting Retry-After)
   - pagination (follows `pagination.next` and unwraps the response envelope)
@@ -83,7 +84,7 @@ class CongressClient:
         api_key: Optional[str] = None,
         base_url: str = BASE_URL,
         max_requests_per_hour: int = MAX_REQUESTS_PER_HOUR,
-        timeout: float = 30.0,
+        timeout: float = 90.0,  # the API sometimes takes 50s+ on tiny responses; a retry would just start the wait over
         page_limit: int = 250,  # API max per page
     ):
 
@@ -130,7 +131,7 @@ class CongressClient:
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
-        session.headers.update({"Accept": "application/json"})
+        session.headers.update({"Accept": "application/json", "X-Api-Key": self.api_key})
         return session
 
     # ----------------------------------------------------------------
@@ -149,7 +150,6 @@ class CongressClient:
         url = self._full_url(path)
         query = dict(params or {})
         query.setdefault("format", "json")
-        query["api_key"] = self.api_key
 
         self._rate_limiter.wait()
 
@@ -274,8 +274,8 @@ class CongressClient:
         """
         parsed = urlparse(next_url)
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-        # api_key gets re-added by get_congress(); drop it here if present
-        # so we don't accidentally carry a stale/mismatched one.
+        # Auth goes in the X-Api-Key header; drop any api_key here so a
+        # stale/mismatched one isn't sent (or logged) in the URL.
         params.pop("api_key", None)
         url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         return url, params

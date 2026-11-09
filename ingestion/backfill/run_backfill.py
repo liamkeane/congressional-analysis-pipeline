@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import requests
+
 from ingestion.congress_client import CongressAPIError, CongressClient, endpoints
 from ingestion.landing.writer import DEFAULT_ROOT, land_raw, landing_dir, landing_path
 
@@ -40,6 +42,10 @@ STATE_DIR = Path(".backfill_state")
 
 # Every source land_bill writes. A bill counts as landed only when all of them exist.
 BILL_SOURCES = ("bill", "bill_actions", "bill_cosponsors", "bill_subjects")
+
+# One failed bill is a blip; this many in a row means the API is down, and
+# carrying on would just spend ~4 minutes of retries failing each remaining bill.
+MAX_CONSECUTIVE_FAILURES = 5
 
 
 def bill_entity_id(congress: int, bill_type: str, bill_number) -> str:
@@ -139,10 +145,12 @@ def land_bills(
     batch_ts: datetime,
     root: Path = DEFAULT_ROOT,
     limit: Optional[int] = None,
+    max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
 ) -> list[str]:
     """
     Phase 2: land each listed bill's detail, actions, cosponsors and subjects,
     skipping bills already landed in this batch. Returns the entity ids that failed.
+    Raises RuntimeError if `max_consecutive_failures` bills in a row fail.
     """
     list_files = sorted(landing_dir("bill_list", congress, batch_ts, root).glob("*.json"))
     if limit is not None:
@@ -151,6 +159,7 @@ def land_bills(
 
     landed = skipped = 0
     failed = []
+    consecutive_failures = 0
 
     for i, f in enumerate(list_files, start=1):
         item = json.loads(f.read_text(encoding="utf-8"))["payload"]
@@ -160,14 +169,21 @@ def land_bills(
         if already_landed(congress, entity_id, batch_ts, root):
             skipped += 1
         else:
-            # Only API errors are caught: a KeyError etc. is a bug in this code,
-            # and should stop the run rather than be logged for every bill.
+            # Only API and network errors are caught: a KeyError etc. is a bug in
+            # this code, and should stop the run rather than be logged for every bill.
             try:
                 land_bill(client, congress, bill_type, bill_number, batch_ts, root)
                 landed += 1
-            except CongressAPIError as exc:
+                consecutive_failures = 0
+            except (CongressAPIError, requests.RequestException) as exc:
                 logger.warning("Failed to land %s: %s", entity_id, exc)
                 failed.append(entity_id)
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    raise RuntimeError(
+                        f"{consecutive_failures} bills in a row failed, so the API is probably down. "
+                        "Stopping; run again later to resume."
+                    ) from exc
 
         if i % 100 == 0 or i == total:
             logger.info(

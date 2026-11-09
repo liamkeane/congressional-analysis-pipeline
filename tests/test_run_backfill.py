@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+import requests
 
 from ingestion.backfill import run_backfill as backfill
 from ingestion.backfill.run_backfill import (
@@ -22,14 +23,16 @@ BATCH_TS = datetime(2026, 10, 25, 15, 30, tzinfo=timezone.utc)
 class FakeClient:
     """
     Stands in for CongressClient: returns canned responses and records every path requested.
-    Paths in `fail_paths` raise CongressAPIError instead, like a 500 that outlasted retries.
+    Paths in `fail_paths` raise `fail_error` instead (by default CongressAPIError, like a 500
+    that outlasted retries).
     """
 
-    def __init__(self, detail=None, actions=(), bill_list=(), fail_paths=()):
+    def __init__(self, detail=None, actions=(), bill_list=(), fail_paths=(), fail_error=None):
         self.detail = detail if detail is not None else FAKE_DETAIL
         self.actions = list(actions)
         self.bill_list = list(bill_list)
         self.fail_paths = set(fail_paths)
+        self.fail_error = fail_error
         self.calls = []
 
     def __enter__(self):
@@ -41,7 +44,7 @@ class FakeClient:
     def _record(self, path):
         self.calls.append(path)
         if path in self.fail_paths:
-            raise CongressAPIError(500, "Internal Server Error", path)
+            raise self.fail_error or CongressAPIError(500, "Internal Server Error", path)
 
     def get_congress(self, path, params=None):
         self._record(path)
@@ -187,6 +190,38 @@ def test_failed_bill_is_reported_and_others_still_land(tmp_path):
     assert already_landed(119, "119-hr-1", BATCH_TS, root=tmp_path)
     assert not already_landed(119, "119-hr-2", BATCH_TS, root=tmp_path)
     assert already_landed(119, "119-s-5", BATCH_TS, root=tmp_path)
+
+
+def test_network_error_counts_as_a_failed_bill(tmp_path):
+    land_bill_list(FakeClient(bill_list=FAKE_BILL_LIST), 119, BATCH_TS, root=tmp_path)
+    client = FakeClient(
+        fail_paths={"/bill/119/hr/2"},
+        fail_error=requests.exceptions.ConnectionError("Read timed out"),
+    )
+
+    failed = land_bills(client, 119, BATCH_TS, root=tmp_path)
+
+    assert failed == ["119-hr-2"]
+    assert already_landed(119, "119-s-5", BATCH_TS, root=tmp_path)
+
+
+def test_stops_after_too_many_failures_in_a_row(tmp_path):
+    land_bill_list(FakeClient(bill_list=FAKE_BILL_LIST), 119, BATCH_TS, root=tmp_path)
+    client = FakeClient(fail_paths={"/bill/119/hr/1", "/bill/119/hr/2", "/bill/119/s/5"})
+
+    with pytest.raises(RuntimeError, match="2 bills in a row failed"):
+        land_bills(client, 119, BATCH_TS, root=tmp_path, max_consecutive_failures=2)
+
+    assert detail_requests(client) == ["/bill/119/hr/1", "/bill/119/hr/2"]
+
+
+def test_a_success_resets_the_failure_streak(tmp_path):
+    land_bill_list(FakeClient(bill_list=FAKE_BILL_LIST), 119, BATCH_TS, root=tmp_path)
+    client = FakeClient(fail_paths={"/bill/119/hr/1", "/bill/119/s/5"})
+
+    failed = land_bills(client, 119, BATCH_TS, root=tmp_path, max_consecutive_failures=2)
+
+    assert failed == ["119-hr-1", "119-s-5"]
 
 
 def test_rerun_retries_only_the_failed_bill(tmp_path):

@@ -69,6 +69,11 @@ def test_api_key_falls_back_to_env(monkeypatch):
     assert CongressClient().api_key == "env-key"
 
 
+def test_api_key_is_sent_as_header_not_in_url():
+    c = CongressClient(api_key="test-key")
+    assert c._session.headers["X-Api-Key"] == "test-key"
+
+
 # ---------------------------------------------------------------------------
 # get_congress
 # ---------------------------------------------------------------------------
@@ -81,7 +86,7 @@ def test_get_congress_builds_url_and_adds_auth(make_client):
     assert result == {"bill": {"number": "5"}}
     call = c._session.calls[0]
     assert call["url"] == "https://api.congress.gov/v3/bill/119/s/5"
-    assert call["params"] == {"foo": "bar", "format": "json", "api_key": "test-key"}
+    assert call["params"] == {"foo": "bar", "format": "json"}
 
 
 def test_get_congress_passes_full_urls_through(make_client):
@@ -205,8 +210,8 @@ def test_paginates_until_next_is_absent(make_client):
     assert second["params"]["offset"] == "250"
     # ...but filters `next` dropped are carried forward.
     assert second["params"]["fromDateTime"] == "2025-01-01T00:00:00Z"
-    # The stale key from `next` is replaced with ours.
-    assert second["params"]["api_key"] == "test-key"
+    # The stale key from `next` is dropped; auth goes in the header.
+    assert "api_key" not in second["params"]
 
 
 def test_stops_on_empty_page_even_if_next_present(make_client):
