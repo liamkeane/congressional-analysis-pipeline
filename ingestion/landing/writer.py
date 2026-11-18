@@ -3,46 +3,35 @@ landing/writer.py
 
 Saves one raw API response to the landing zone as a JSON file.
 
-Files are laid out the way they will be in blob storage later:
+Files are laid out the same way on local disk and in S3:
 
-    {root}/{source}/dt=YYYY-MM-DD/congress=NNN/{entity_id}.json
+    {source}/dt=YYYY-MM-DD/congress=NNN/{entity_id}.json
 
 `dt` is the date the data was pulled (from batch_ts), not a legislative date!
+Where those keys physically live is up to the Storage passed in (see storage.py).
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
-DEFAULT_ROOT = Path("raw_data")
+from .storage import Storage
 
 
-def landing_dir(
-    source: str,
-    congress: Optional[int],
-    batch_ts: datetime,
-    root: Path = DEFAULT_ROOT,
-) -> Path:
-    """The folder one batch of a source lands in. Doesn't touch the disk."""
+def landing_prefix(source: str, congress: Optional[int], batch_ts: datetime) -> str:
+    """The key prefix ("folder") one batch of a source lands under, ending in "/"."""
     if batch_ts.tzinfo is None:
         raise ValueError("batch_ts must be timezone-aware, e.g. datetime.now(timezone.utc)")
     batch_date = batch_ts.astimezone(timezone.utc).date()
 
-    return Path(root) / source / f"dt={batch_date.isoformat()}" / f"congress={congress}"
+    return f"{source}/dt={batch_date.isoformat()}/congress={congress}/"
 
 
-def landing_path(
-    source: str,
-    congress: Optional[int],
-    entity_id: str,
-    batch_ts: datetime,
-    root: Path = DEFAULT_ROOT,
-) -> Path:
-    """Where a response for this entity lands. Doesn't touch the disk."""
-    return landing_dir(source, congress, batch_ts, root) / f"{entity_id}.json"
+def landing_key(source: str, congress: Optional[int], entity_id: str, batch_ts: datetime) -> str:
+    """Where a response for this entity lands."""
+    return f"{landing_prefix(source, congress, batch_ts)}{entity_id}.json"
 
 
 def land_raw(
@@ -51,14 +40,13 @@ def land_raw(
     congress: Optional[int],
     entity_id: str,
     batch_ts: datetime,
-    root: Path = DEFAULT_ROOT,
-) -> Path:
+    storage: Storage,
+) -> str:
     """
     Write `payload` (the API response, untouched) plus a little metadata.
-    Returns the path written. Writing the same entity again overwrites it.
+    Returns the key written. Writing the same entity again overwrites it.
     """
-    path = landing_path(source, congress, entity_id, batch_ts, root)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    key = landing_key(source, congress, entity_id, batch_ts)
 
     record = {
         "source": source,   # ie "bill", "bill_actions", "member", etc.
@@ -68,10 +56,5 @@ def land_raw(
         "payload": payload,
     }
 
-    # Write to a temp file first, then rename it into place. The rename is
-    # all-or-nothing, so a crash mid-write can't leave a half-written .json
-    # that looks finished.
-    tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")   # TODO return to this rename logic
-    tmp_path.replace(path)
-    return path
+    storage.write_text(key, json.dumps(record, ensure_ascii=False))
+    return key

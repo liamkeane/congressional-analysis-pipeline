@@ -16,6 +16,9 @@ time, so a resumed run (even on a later day) writes into the same `dt=`
 folder, and bills whose files already exist there are skipped. Bills
 that fail are logged and left unlanded, so running again retries them.
 
+Files land in the S3 bucket named by LANDING_BUCKET (in .env), or under
+raw_data/ on local disk if it isn't set. The state file always stays local.
+
 Run from the repo root:
     python3 -m ingestion.backfill.run_backfill 119
     python3 -m ingestion.backfill.run_backfill 119 --limit 20   # try it on a few bills
@@ -32,7 +35,8 @@ from typing import Optional
 import requests
 
 from ingestion.congress_client import CongressAPIError, CongressClient, endpoints
-from ingestion.landing.writer import DEFAULT_ROOT, land_raw, landing_dir, landing_path
+from ingestion.landing.storage import Storage, storage_from_env
+from ingestion.landing.writer import land_raw, landing_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +62,11 @@ def land_bill(
     bill_type: str,
     bill_number: int,
     batch_ts: datetime,
-    root: Path = DEFAULT_ROOT,
-) -> list[Path]:
+    storage: Storage,
+) -> list[str]:
     """
     Fetch one bill's detail, actions, cosponsors, and subjects and land each as its own file.
-    Returns the paths written.
+    Returns the keys written.
     """
     bill_type = bill_type.lower()  # the API lists types as "HR", but endpoints expect "hr"
     entity_id = bill_entity_id(congress, bill_type, bill_number)
@@ -73,19 +77,27 @@ def land_bill(
     subjects = list(endpoints.get_bill_subjects(client, congress, bill_type, bill_number))
 
     return [
-        land_raw(detail, "bill", congress, entity_id, batch_ts, root),
-        land_raw(actions, "bill_actions", congress, entity_id, batch_ts, root),
-        land_raw(cosponsors, "bill_cosponsors", congress, entity_id, batch_ts, root),
-        land_raw(subjects, "bill_subjects", congress, entity_id, batch_ts, root),
+        land_raw(detail, "bill", congress, entity_id, batch_ts, storage),
+        land_raw(actions, "bill_actions", congress, entity_id, batch_ts, storage),
+        land_raw(cosponsors, "bill_cosponsors", congress, entity_id, batch_ts, storage),
+        land_raw(subjects, "bill_subjects", congress, entity_id, batch_ts, storage),
     ]
 
 
-def already_landed(congress: int, entity_id: str, batch_ts: datetime, root: Path = DEFAULT_ROOT) -> bool:
-    # land_raw renames files into place, so a file that exists is complete.
-    return all(
-        landing_path(source, congress, entity_id, batch_ts, root).exists()
-        for source in BILL_SOURCES
-    )
+def entity_ids_under(storage: Storage, source: str, congress: int, batch_ts: datetime) -> set[str]:
+    """Entity ids landed for one source in this batch, e.g. {"119-hr-1", "119-s-5"}."""
+    keys = storage.list_keys(landing_prefix(source, congress, batch_ts))
+    return {key.rsplit("/", 1)[-1].removesuffix(".json") for key in keys}
+
+
+def landed_entity_ids(storage: Storage, congress: int, batch_ts: datetime) -> set[str]:
+    """
+    Bills with every source in BILL_SOURCES landed in this batch. Writes are
+    all-or-nothing, so a key that exists is a complete file. Listing each
+    source once is ~4 requests per 1,000 bills on S3, versus 4 per bill
+    if we checked bills one by one.
+    """
+    return set.intersection(*(entity_ids_under(storage, source, congress, batch_ts) for source in BILL_SOURCES))
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +141,11 @@ def load_or_create_state(congress: int, state_dir: Path = STATE_DIR, fresh: bool
 # Phases
 # ---------------------------------------------------------------------------
 
-def land_bill_list(client: CongressClient, congress: int, batch_ts: datetime, root: Path = DEFAULT_ROOT) -> int:
+def land_bill_list(client: CongressClient, congress: int, batch_ts: datetime, storage: Storage) -> int:
     """Phase 1: land every item from the bill list endpoint. Returns how many were landed."""
     count = 0
     for bill in endpoints.get_bills(client, congress):
-        land_raw(bill, "bill_list", congress, bill_entity_id(congress, bill["type"], bill["number"]), batch_ts, root)
+        land_raw(bill, "bill_list", congress, bill_entity_id(congress, bill["type"], bill["number"]), batch_ts, storage)
         count += 1
     logger.info("Listed %d bills for Congress %d", count, congress)
     return count
@@ -143,7 +155,7 @@ def land_bills(
     client: CongressClient,
     congress: int,
     batch_ts: datetime,
-    root: Path = DEFAULT_ROOT,
+    storage: Storage,
     limit: Optional[int] = None,
     max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
 ) -> list[str]:
@@ -152,27 +164,28 @@ def land_bills(
     skipping bills already landed in this batch. Returns the entity ids that failed.
     Raises RuntimeError if `max_consecutive_failures` bills in a row fail.
     """
-    list_files = sorted(landing_dir("bill_list", congress, batch_ts, root).glob("*.json"))
+    # The list items' entity ids ("119-hr-1") already hold the type and number
+    # we need, so the list files themselves never have to be read back.
+    to_land = sorted(entity_ids_under(storage, "bill_list", congress, batch_ts))
     if limit is not None:
-        list_files = list_files[:limit]
-    total = len(list_files)
+        to_land = to_land[:limit]
+    total = len(to_land)
+    done = landed_entity_ids(storage, congress, batch_ts)
 
     landed = skipped = 0
     failed = []
     consecutive_failures = 0
 
-    for i, f in enumerate(list_files, start=1):
-        item = json.loads(f.read_text(encoding="utf-8"))["payload"]
-        bill_type, bill_number = item["type"], item["number"]
-        entity_id = bill_entity_id(congress, bill_type, bill_number)
+    for i, entity_id in enumerate(to_land, start=1):
+        _, bill_type, bill_number = entity_id.split("-")
 
-        if already_landed(congress, entity_id, batch_ts, root):
+        if entity_id in done:
             skipped += 1
         else:
             # Only API and network errors are caught: a KeyError etc. is a bug in
             # this code, and should stop the run rather than be logged for every bill.
             try:
-                land_bill(client, congress, bill_type, bill_number, batch_ts, root)
+                land_bill(client, congress, bill_type, bill_number, batch_ts, storage)
                 landed += 1
                 consecutive_failures = 0
             except (CongressAPIError, requests.RequestException) as exc:
@@ -200,7 +213,7 @@ def land_bills(
 
 def run_backfill(
     congress: int,
-    root: Path = DEFAULT_ROOT,
+    storage: Optional[Storage] = None,
     state_dir: Path = STATE_DIR,
     fresh: bool = False,
     limit: Optional[int] = None,
@@ -209,6 +222,9 @@ def run_backfill(
     Run (or resume) a backfill of the raw landing zone for the specified
     Congress number. Returns the entity ids of bills that failed to land.
     """
+    storage = storage or storage_from_env()
+    logger.info("Landing to %s", storage)
+
     state = load_or_create_state(congress, state_dir, fresh)
     batch_ts = datetime.fromisoformat(state["batch_ts"])
 
@@ -216,11 +232,11 @@ def run_backfill(
         if state["list_complete"]:
             logger.info("Bill list already landed; skipping phase 1")
         else:
-            land_bill_list(client, congress, batch_ts, root)
+            land_bill_list(client, congress, batch_ts, storage)
             state["list_complete"] = True
             save_state(state, state_dir)
 
-        failed = land_bills(client, congress, batch_ts, root, limit)
+        failed = land_bills(client, congress, batch_ts, storage, limit)
 
     if failed:
         logger.warning("%d bills failed; run again to retry them", len(failed))
